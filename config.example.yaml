@@ -1,0 +1,47 @@
+# Prenotami Booker Configuration
+# Copy this to config.yaml and fill in your details.
+# Credentials can also be set via environment variables (see .env.example).
+
+# Prenot@mi portal credentials
+prenotami:
+  email: "your-email@example.com"
+  password: "your-prenotami-password"
+
+# Email settings for OTP retrieval (IMAP)
+# The bot reads OTP codes from your email inbox
+email:
+  imap_server: "imap.gmail.com"   # Gmail, Outlook: outlook.office365.com
+  imap_port: 993
+  email: "your-email@example.com"  # Same as prenotami email if shared
+  password: "your-email-app-password"  # Use app password for Gmail
+  use_ssl: true
+
+# Notification settings (optional)
+# Get notified when a booking succeeds or fails
+notification:
+  smtp_server: "smtp.gmail.com"     # Gmail, Outlook: smtp.office365.com
+  smtp_port: 587
+  smtp_email: "your-email@example.com"
+  smtp_password: "your-email-app-password"
+  notify_email: "your-email@example.com"  # Where to send notifications
+  use_tls: true
+
+# Consulate configuration
+# Defaults are for the London consulate
+consulate:
+  name: "London"
+  release_days:
+    - "monday"
+    - "wednesday"
+  release_time: "17:00"              # UTC/GMT
+  timing_offset_seconds: -2          # Click 2 seconds BEFORE release
+  calendar_months_ahead: 3           # Skip this many months in calendar
+  otp_prefetch_seconds: 120          # Generate OTP 2 min before release
+  service_type: "citizenship"        # citizenship or passport
+
+# Browser settings
+browser:
+  headless: false                    # Set true for background/server mode
+  browser: "chrome"
+  implicit_wait: 10                  # Seconds to wait for elements
+  page_load_timeout: 30              # Max seconds for page load

@@ -94,7 +94,18 @@ def _check_inbox_for_otp(
         mail = imaplib.IMAP4(config.imap_server, config.imap_port)
 
     try:
-        mail.login(config.email, config.password)
+        if config.use_oauth:
+            from prenotami_booker.gmail_oauth import build_xoauth2_string, get_gmail_credentials
+
+            creds = get_gmail_credentials(correlation_id=correlation_id)
+            if creds.expired:
+                from google.auth.transport.requests import Request
+
+                creds.refresh(Request())
+            auth_string = build_xoauth2_string(config.email, creds.token)
+            mail.authenticate("XOAUTH2", lambda x: auth_string.encode())
+        else:
+            mail.login(config.email, config.password)
         mail.select("INBOX")
 
         # Search for recent unread emails

@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from datetime import UTC, datetime, timedelta
 
+import ntplib
 import structlog
 
 from prenotami_booker.config import ConsulateConfig
@@ -21,6 +22,47 @@ DAY_MAP: dict[str, int] = {
     "saturday": 5,
     "sunday": 6,
 }
+
+NTP_SERVERS = ["pool.ntp.org", "time.google.com", "time.cloudflare.com"]
+
+
+def get_ntp_offset(*, correlation_id: str) -> float:
+    """Query NTP servers to determine local clock offset.
+
+    Tries multiple NTP servers in order. Returns the offset in seconds
+    (positive means local clock is ahead of real time).
+
+    Args:
+        correlation_id: Correlation ID for logging.
+
+    Returns:
+        Clock offset in seconds, or 0.0 if NTP is unreachable.
+    """
+    for server in NTP_SERVERS:
+        try:
+            client = ntplib.NTPClient()
+            response = client.request(server, version=3)
+            offset = response.offset
+            logger.info(
+                "ntp_sync_success",
+                correlation_id=correlation_id,
+                server=server,
+                offset_seconds=round(offset, 4),
+            )
+            return offset
+        except (ntplib.NTPException, OSError):
+            logger.debug(
+                "ntp_server_unreachable",
+                correlation_id=correlation_id,
+                server=server,
+            )
+            continue
+
+    logger.warning(
+        "ntp_sync_failed_using_local_clock",
+        correlation_id=correlation_id,
+    )
+    return 0.0
 
 
 def get_next_release_time(config: ConsulateConfig, *, correlation_id: str) -> datetime:
@@ -75,6 +117,7 @@ def wait_until(
     *,
     correlation_id: str,
     offset_seconds: int = 0,
+    ntp_offset: float = 0.0,
 ) -> None:
     """Wait until the target time (with optional offset).
 
@@ -85,9 +128,10 @@ def wait_until(
         target: UTC datetime to wait until.
         correlation_id: Correlation ID for logging.
         offset_seconds: Seconds to offset from target (negative = before).
+        ntp_offset: NTP clock offset in seconds (from get_ntp_offset).
     """
     adjusted_target = target + timedelta(seconds=offset_seconds)
-    now = datetime.now(UTC)
+    now = datetime.now(UTC) + timedelta(seconds=ntp_offset)
     wait_seconds = (adjusted_target - now).total_seconds()
 
     if wait_seconds <= 0:
@@ -104,6 +148,7 @@ def wait_until(
         target=adjusted_target.isoformat(),
         wait_seconds=round(wait_seconds, 1),
         offset_seconds=offset_seconds,
+        ntp_offset=round(ntp_offset, 4),
     )
 
     # Coarse sleep until 5 seconds before target
@@ -111,7 +156,7 @@ def wait_until(
         time.sleep(wait_seconds - 5)
 
     # Log countdown at 5 seconds
-    remaining = (adjusted_target - datetime.now(UTC)).total_seconds()
+    remaining = (adjusted_target - (datetime.now(UTC) + timedelta(seconds=ntp_offset))).total_seconds()
     if remaining > 0:
         logger.info(
             "countdown_final_seconds",
@@ -120,7 +165,7 @@ def wait_until(
         )
 
     # Busy-wait for sub-second precision
-    while datetime.now(UTC) < adjusted_target:
+    while (datetime.now(UTC) + timedelta(seconds=ntp_offset)) < adjusted_target:
         time.sleep(0.01)  # 10ms resolution
 
     logger.info(

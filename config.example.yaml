@@ -9,12 +9,19 @@ prenotami:
 
 # Email settings for OTP retrieval (IMAP)
 # The bot reads OTP codes from your email inbox
+#
+# Option A - OAuth2 (recommended): Run 'prenotami auth' to sign in via browser.
+#   No password needed — just set your email address and use_oauth: true.
+#   Requires client_secret.json from Google Cloud Console.
+#
+# Option B - App password: Set use_oauth: false and provide password.
 email:
   imap_server: "imap.gmail.com"   # Gmail, Outlook: outlook.office365.com
   imap_port: 993
   email: "your-email@example.com"  # Same as prenotami email if shared
-  password: "your-email-app-password"  # Use app password for Gmail
+  # password: "your-email-app-password"  # Only needed if use_oauth is false
   use_ssl: true
+  use_oauth: true                  # Sign in via browser (run 'prenotami auth')
 
 # Notification settings (optional)
 # Get notified when a booking succeeds or fails

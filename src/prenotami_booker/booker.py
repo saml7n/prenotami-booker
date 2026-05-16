@@ -33,11 +33,14 @@ from prenotami_booker.config import AppConfig
 logger = structlog.get_logger()
 
 PRENOTAMI_URL = "https://prenotami.esteri.it"
+IAM_LOGIN_DOMAIN = "iam.esteri.it"
 SERVICES_PATH = "/Services"
 BOOKING_PATH = "/Services/Ede"  # Citizenship by descent booking page
 
 # Timeout constants
-LOGIN_TIMEOUT = 15
+LOGIN_TIMEOUT = 30
+LOGIN_MAX_RETRIES = 3
+LOGIN_RETRY_DELAY = 5
 PAGE_LOAD_TIMEOUT = 30
 CALENDAR_LOAD_TIMEOUT = 60
 ELEMENT_WAIT_TIMEOUT = 10
@@ -73,7 +76,16 @@ class BookingOutcome:
 
 
 def login(driver: WebDriver, config: AppConfig, *, correlation_id: str) -> bool:
-    """Login to the Prenot@mi portal.
+    """Login to the Prenot@mi portal via the iam.esteri.it OAuth flow.
+
+    Retries up to LOGIN_MAX_RETRIES times to handle transient server errors
+    (the /pingid callback is known to return 500 intermittently).
+
+    The flow per attempt is:
+    1. Load prenotami.esteri.it
+    2. Click the "EFFETTUARE IL LOGIN" link → redirects to iam.esteri.it
+    3. Fill username + password on the IAM login form
+    4. Click submit → redirects back to prenotami.esteri.it/Services
 
     Args:
         driver: Selenium WebDriver instance.
@@ -83,15 +95,61 @@ def login(driver: WebDriver, config: AppConfig, *, correlation_id: str) -> bool:
     Returns:
         True if login successful, False otherwise.
     """
-    logger.info("login_started", correlation_id=correlation_id)
+    for attempt in range(1, LOGIN_MAX_RETRIES + 1):
+        logger.info(
+            "login_attempt",
+            correlation_id=correlation_id,
+            attempt=attempt,
+            max_retries=LOGIN_MAX_RETRIES,
+        )
+        success = _login_attempt(driver, config, correlation_id=correlation_id)
+        if success:
+            return True
 
+        if attempt < LOGIN_MAX_RETRIES:
+            logger.warning(
+                "login_retrying",
+                correlation_id=correlation_id,
+                attempt=attempt,
+                delay=LOGIN_RETRY_DELAY,
+            )
+            time.sleep(LOGIN_RETRY_DELAY)
+
+    logger.error(
+        "login_all_attempts_failed",
+        correlation_id=correlation_id,
+        attempts=LOGIN_MAX_RETRIES,
+    )
+    return False
+
+
+def _login_attempt(
+    driver: WebDriver, config: AppConfig, *, correlation_id: str
+) -> bool:
+    """Single login attempt via iam.esteri.it OAuth flow."""
     try:
         driver.get(PRENOTAMI_URL)
         wait = WebDriverWait(driver, LOGIN_TIMEOUT)
 
-        # Wait for login form
-        email_field = wait.until(ec.presence_of_element_located((By.ID, "login-email")))
-        password_field = driver.find_element(By.ID, "login-password")
+        # Step 1: Click the login link on the Prenot@mi homepage
+        login_link = wait.until(
+            ec.element_to_be_clickable((By.CSS_SELECTOR, "a.button.primary"))
+        )
+        logger.info("login_clicking_oauth_link", correlation_id=correlation_id)
+        login_link.click()
+
+        # Step 2: Wait for redirect to iam.esteri.it and fill the login form
+        wait.until(ec.url_contains(IAM_LOGIN_DOMAIN))
+        logger.info(
+            "login_on_iam_page",
+            correlation_id=correlation_id,
+            url=driver.current_url,
+        )
+
+        email_field = wait.until(
+            ec.presence_of_element_located((By.NAME, "callback_1"))
+        )
+        password_field = driver.find_element(By.NAME, "callback_2")
 
         # Clear and fill credentials
         email_field.clear()
@@ -99,12 +157,19 @@ def login(driver: WebDriver, config: AppConfig, *, correlation_id: str) -> bool:
         password_field.clear()
         password_field.send_keys(config.prenotami.password)
 
-        # Click login button
-        login_btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-        login_btn.click()
+        # Click submit
+        submit_btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+        submit_btn.click()
 
-        # Wait for redirect to services page (indicates successful login)
-        wait.until(ec.url_contains("/Services"))
+        # Step 3: Wait until the OAuth /pingid callback completes and the server
+        # redirects us to a proper post-login page (/UserArea or /Services).
+        # We specifically exclude /pingid itself because it can return 500 briefly
+        # before redirecting, and a transient prenotami.esteri.it URL is not
+        # sufficient to confirm a valid session.
+        wait.until(
+            lambda d: d.current_url.startswith(PRENOTAMI_URL)
+            and not d.current_url.startswith(f"{PRENOTAMI_URL}/pingid")
+        )
 
         logger.info("login_successful", correlation_id=correlation_id)
         return True
@@ -126,11 +191,14 @@ def login(driver: WebDriver, config: AppConfig, *, correlation_id: str) -> bool:
 
 
 def trigger_otp_via_passport(driver: WebDriver, *, correlation_id: str) -> bool:
-    """Trigger OTP generation via the Passport appointment page.
+    """Trigger OTP generation via any available service booking page.
 
-    This implements "Trick #1" from the guide: the OTP can be generated
-    from any service page, so we use the Passport page which is always
-    available (unlike citizenship which only works at release time).
+    This implements "Trick #1" from the guide: the OTP can be generated from
+    any service booking form, so we try passport first (usually available), then
+    fall back to any other enabled PRENOTA button.
+
+    Some services show a "no slots" modal instead of loading the booking form.
+    In that case we dismiss the modal and try the next service.
 
     Args:
         driver: Selenium WebDriver instance.
@@ -142,42 +210,32 @@ def trigger_otp_via_passport(driver: WebDriver, *, correlation_id: str) -> bool:
     logger.info("otp_trigger_started", correlation_id=correlation_id)
 
     try:
-        # Navigate to services page
         driver.get(f"{PRENOTAMI_URL}{SERVICES_PATH}")
         wait = WebDriverWait(driver, PAGE_LOAD_TIMEOUT)
-
-        # Wait for services to load
         wait.until(ec.presence_of_element_located((By.CSS_SELECTOR, ".card, table, .list-group")))
-        time.sleep(2)  # Allow dynamic content to render
+        time.sleep(2)
 
-        # Find and click the Passport booking button ("Prenota" button for passports)
-        # The passport service typically has an ID or specific text
-        passport_book_btn = _find_service_book_button(driver, "Passaporto")
-        if not passport_book_btn:
-            # Try alternative selectors
-            passport_book_btn = _find_service_book_button(driver, "Passport")
+        # Preferred order: passport first, then any other service.
+        # We re-fetch buttons after each modal dismiss to get fresh references.
+        preferred = ["Passaporto", "Passport", "Carta d'identità", "Cittadinanza"]
 
-        if not passport_book_btn:
-            logger.error("passport_button_not_found", correlation_id=correlation_id)
-            return False
+        for service_name in preferred:
+            btn = _find_service_book_button(driver, service_name)
+            if btn and _try_otp_via_service(driver, btn, service_name, correlation_id=correlation_id):
+                return True
 
-        passport_book_btn.click()
-        time.sleep(3)  # Wait for page to load
+        # Last resort: try every remaining enabled PRENOTA button
+        try:
+            all_buttons = driver.find_elements(By.CSS_SELECTOR, "button, a.btn")
+            for btn in all_buttons:
+                if "prenota" in btn.text.strip().lower() and btn.is_enabled():
+                    if _try_otp_via_service(driver, btn, btn.text.strip(), correlation_id=correlation_id):
+                        return True
+        except (NoSuchElementException, WebDriverException):
+            pass
 
-        # Scroll down to find the OTP section
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(1)
-
-        # Click "Invia Nuovo Codice" (Send New Code) button to generate OTP
-        otp_button = _find_otp_send_button(driver)
-        if not otp_button:
-            logger.error("otp_send_button_not_found", correlation_id=correlation_id)
-            return False
-
-        otp_button.click()
-
-        logger.info("otp_triggered_via_passport", correlation_id=correlation_id)
-        return True
+        logger.error("otp_send_button_not_found", correlation_id=correlation_id)
+        return False
 
     except (TimeoutException, WebDriverException) as exc:
         logger.error(
@@ -186,6 +244,82 @@ def trigger_otp_via_passport(driver: WebDriver, *, correlation_id: str) -> bool:
             error=str(type(exc).__name__),
         )
         return False
+
+
+def _try_otp_via_service(
+    driver: WebDriver,
+    btn: object,
+    service_name: str,
+    *,
+    correlation_id: str,
+) -> bool:
+    """Click a PRENOTA button and attempt to send an OTP from its booking form.
+
+    Returns True if OTP was triggered, False if the service had no slots or
+    the OTP button was not found.
+    """
+    services_url = f"{PRENOTAMI_URL}{SERVICES_PATH}"
+    try:
+        btn.click()  # type: ignore[union-attr]
+        time.sleep(3)
+
+        # If a "no slots" modal appeared, the URL stays on /Services.
+        # Dismiss the modal and report failure for this service.
+        if BOOKING_PATH not in driver.current_url:
+            logger.info(
+                "otp_service_no_slots_modal",
+                correlation_id=correlation_id,
+                service=service_name,
+            )
+            _dismiss_no_slots_modal(driver)
+            time.sleep(1)
+            return False
+
+        # We're on the booking form — find and click the OTP send button.
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(1)
+        otp_button = _find_otp_send_button(driver)
+        if otp_button:
+            otp_button.click()
+            logger.info(
+                "otp_triggered",
+                correlation_id=correlation_id,
+                service=service_name,
+            )
+            return True
+
+        logger.warning(
+            "otp_button_not_on_form",
+            correlation_id=correlation_id,
+            service=service_name,
+        )
+        # Navigate back to services for next attempt
+        driver.get(services_url)
+        time.sleep(2)
+        return False
+
+    except (NoSuchElementException, WebDriverException):
+        # Element gone (e.g. stale ref after modal dismiss) — navigate back
+        try:
+            driver.get(services_url)
+            time.sleep(2)
+        except WebDriverException:
+            pass
+        return False
+
+
+def _dismiss_no_slots_modal(driver: WebDriver) -> None:
+    """Click OK on the 'no available slots' modal if present."""
+    try:
+        ok_buttons = driver.find_elements(By.CSS_SELECTOR, "button, .btn")
+        for btn in ok_buttons:
+            if btn.text.strip().upper() in ("OK", "CHIUDI", "CLOSE"):
+                btn.click()
+                return
+        # Fallback: try any visible dialog confirm button
+        driver.find_element(By.CSS_SELECTOR, "[data-dismiss='modal'], .modal .btn-primary").click()
+    except (NoSuchElementException, WebDriverException):
+        pass
 
 
 def navigate_to_services(driver: WebDriver, *, correlation_id: str) -> bool:
@@ -230,24 +364,41 @@ def click_citizenship_booking(driver: WebDriver, *, correlation_id: str) -> bool
     )
 
     try:
-        # Find citizenship booking button
-        citizenship_btn = _find_service_book_button(driver, "Cittadinanza")
-        if not citizenship_btn:
-            citizenship_btn = _find_service_book_button(driver, "Citizenship")
-        if not citizenship_btn:
-            # Try broader search - look for any Prenota button related to citizenship
-            citizenship_btn = _find_service_book_button(driver, "discendenza")
-        if not citizenship_btn:
-            citizenship_btn = _find_service_book_button(driver, "descent")
+        # Find citizenship booking button.
+        # Search most-specific first to avoid matching "Riacquisto della cittadinanza"
+        # (also CITTADINANZA category, but has no PRENOTA button).
+        citizenship_btn = (
+            _find_service_book_button(driver, "discendenza")
+            or _find_service_book_button(driver, "descent")
+            or _find_service_book_button(driver, "Cittadinanza")
+            or _find_service_book_button(driver, "Citizenship")
+        )
 
         if not citizenship_btn:
             logger.error("citizenship_button_not_found", correlation_id=correlation_id)
             return False
 
-        citizenship_btn.click()
+        if not citizenship_btn.is_enabled():  # type: ignore[union-attr]
+            logger.warning("citizenship_button_disabled", correlation_id=correlation_id)
+            return False
 
-        # Wait for the booking page to load (this can take 5-15 seconds per the guide)
-        WebDriverWait(driver, PAGE_LOAD_TIMEOUT)
+        citizenship_btn.click()  # type: ignore[union-attr]
+
+        # Check quickly if a "no slots" modal appeared (URL stays on /Services)
+        time.sleep(3)
+        if BOOKING_PATH not in driver.current_url:
+            _dismiss_no_slots_modal(driver)
+            logger.warning(
+                "citizenship_no_slots_modal",
+                correlation_id=correlation_id,
+                url=driver.current_url,
+            )
+            return False
+
+        # We're on the booking form — wait for it to fully load
+        WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
+            ec.url_contains(BOOKING_PATH)
+        )
         time.sleep(2)
 
         logger.info(
@@ -514,10 +665,40 @@ def navigate_calendar_and_book(
             message="Calendar page timed out",
         )
     except WebDriverException as exc:
-        logger.error(
-            "calendar_error",
+        logger.warning(
+            "calendar_error_retrying",
             correlation_id=correlation_id,
             error=str(type(exc).__name__),
+        )
+        # Per guide advice: refresh and retry once on browser errors
+        try:
+            driver.refresh()
+            time.sleep(5)
+            available_date = _find_available_date(driver)
+            if available_date:
+                available_date.click()
+                time.sleep(2)
+                book_btn = _find_button_by_text(driver, "Prenota")
+                if not book_btn:
+                    book_btn = _find_button_by_text(driver, "Book")
+                if book_btn:
+                    book_btn.click()
+                    time.sleep(3)
+                    _handle_confirmation_popup(driver, correlation_id=correlation_id)
+                    time.sleep(2)
+                    appointment_date, appointment_time = _extract_appointment_details(driver)
+                    return BookingOutcome(
+                        result=BookingResult.SUCCESS,
+                        appointment_date=appointment_date or "",
+                        appointment_time=appointment_time or "See confirmation page",
+                        message="Appointment booked after calendar retry",
+                    )
+        except WebDriverException:
+            pass
+
+        logger.error(
+            "calendar_error_retry_failed",
+            correlation_id=correlation_id,
         )
         return BookingOutcome(
             result=BookingResult.CALENDAR_ERROR,
@@ -549,12 +730,13 @@ def _find_service_book_button(driver: WebDriver, service_text: str) -> object | 
                 buttons = row.find_elements(By.CSS_SELECTOR, "a.btn, button.btn, a[href*='Book']")
                 for btn in buttons:
                     btn_text = btn.text.strip().lower()
-                    if btn_text in ("prenota", "book", ""):
+                    if btn_text in ("prenota", "book", "") and btn.is_enabled():
                         return btn
                 # If no labeled button, try any link/button
                 links = row.find_elements(By.CSS_SELECTOR, "a, button")
                 for link in links:
-                    if "prenota" in link.text.lower() or "book" in link.text.lower():
+                    if ("prenota" in link.text.lower() or "book" in link.text.lower()) \
+                            and link.is_enabled():
                         return link
 
         # Strategy 2: Look for buttons with data attributes or specific hrefs

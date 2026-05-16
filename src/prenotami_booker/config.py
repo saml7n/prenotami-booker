@@ -36,8 +36,9 @@ class EmailConfig:
     imap_server: str
     imap_port: int
     email: str
-    password: str
+    password: str = ""
     use_ssl: bool = True
+    use_oauth: bool = False
 
 
 @dataclass(frozen=True)
@@ -131,12 +132,15 @@ def load_config(config_path: str | None = None, env_path: str | None = None) -> 
 
     # Build email config for OTP
     email_cfg_raw = yaml_config.get("email", {})
+    imap_password = os.getenv("IMAP_PASSWORD", email_cfg_raw.get("password", ""))
+    use_oauth = email_cfg_raw.get("use_oauth", not imap_password)
     email_config = EmailConfig(
         imap_server=os.getenv("IMAP_SERVER", email_cfg_raw.get("imap_server", "imap.gmail.com")),
         imap_port=int(os.getenv("IMAP_PORT", email_cfg_raw.get("imap_port", 993))),
         email=os.getenv("IMAP_EMAIL", email_cfg_raw.get("email", prenotami_email)),
-        password=os.getenv("IMAP_PASSWORD", email_cfg_raw.get("password", "")),
+        password=imap_password,
         use_ssl=email_cfg_raw.get("use_ssl", True),
+        use_oauth=use_oauth,
     )
 
     # Build notification config

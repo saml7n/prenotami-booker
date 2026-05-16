@@ -164,5 +164,32 @@ def check_config(ctx: click.Context) -> None:
         sys.exit(1)
 
 
+@main.command()
+def auth() -> None:
+    """Authenticate with Gmail via OAuth2 (browser sign-in).
+
+    Opens a browser window for Google sign-in so the bot can read
+    OTP emails without needing your Gmail password. Only needs to be
+    run once — the token is cached in token.json.
+
+    Requires a client_secret.json file from Google Cloud Console.
+    """
+    from prenotami_booker.gmail_oauth import get_gmail_credentials
+
+    click.echo("Starting Gmail OAuth2 authentication...")
+    click.echo("A browser window will open for Google sign-in.\n")
+
+    try:
+        creds = get_gmail_credentials(correlation_id="cli-auth")
+        click.echo("Authentication successful!")
+        click.echo("Token saved to token.json — the bot can now read your emails.")
+    except FileNotFoundError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    except Exception as exc:
+        click.echo(f"Authentication failed: {exc}", err=True)
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()

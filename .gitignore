@@ -21,6 +21,8 @@ env/
 # Config with secrets
 .env
 config.yaml
+token.json
+client_secret.json
 
 # OS
 .DS_Store
@@ -31,3 +33,6 @@ Thumbs.db
 
 # Screenshots from booking attempts
 screenshots/
+
+# Playwright MCP session artifacts (may contain DOM snapshots of login forms)
+.playwright-mcp/
